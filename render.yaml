@@ -1,0 +1,29 @@
+# render.yaml — Render.com deployment configuration
+# Deploy: connect GitHub repo → "New Web Service" → uses this file automatically
+
+services:
+  - type: web
+    name: ai-trading-engine
+    env: python
+    plan: free                        # free tier: 512MB RAM, shared CPU
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /health
+    autoDeploy: true
+
+    envVars:
+      - key: ENV
+        value: production
+      - key: LOG_LEVEL
+        value: INFO
+      - key: AI_CACHE_TTL
+        value: "900"
+      - key: CACHE_TTL_HOURS
+        value: "4"
+      - key: CORS_ORIGINS
+        value: "*"
+      # Add your optional API keys in Render dashboard → Environment
+      # - key: ALPHA_VANTAGE_KEY
+      #   value: your_key
+      # - key: FINNHUB_KEY
+      #   value: your_key

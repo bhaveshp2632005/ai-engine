@@ -1,0 +1,54 @@
+# ───────── Python ─────────
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# ───────── Virtual Environments ─────────
+venv/
+.venv/
+env/
+.env
+!.env.example
+
+# ───────── Data & Models (large files) ─────────
+data/
+models/
+charts/
+*.csv
+*.pkl
+*.pt
+*.pth
+*.h5
+*.joblib
+
+# ───────── Logs ─────────
+*.log
+logs/
+
+# ───────── IDE / Editor ─────────
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+
+# ───────── OS Files ─────────
+Thumbs.db
+
+# ───────── Testing / Coverage ─────────
+.coverage
+htmlcov/
+.pytest_cache/
+
+# ───────── Jupyter Notebook ─────────
+.ipynb_checkpoints/
+
+# ───────── Render / Deployment ─────────
+.render-buildpacks.json
