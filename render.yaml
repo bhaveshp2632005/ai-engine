@@ -1,27 +1,21 @@
-# render.yaml — Render.com deployment configuration
-
 services:
   - type: web
     name: ai-trading-engine
     env: python
+    # pythonVersion here is for display only — runtime.txt controls the actual version
+    # But include it anyway for newer Render dashboard versions
+    pythonVersion: "3.10.13"
     plan: free
-
-    buildCommand: pip install -r requirements.txt
+    buildCommand: pip install --upgrade pip setuptools wheel && pip install -r requirements.txt
     startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
     healthCheckPath: /health
     autoDeploy: true
-
     envVars:
-      - key: PYTHON_VERSION
-        value: 3.10.13   # 🔥 VERY IMPORTANT (fixes your error)
-
       - key: ENV
         value: production
       - key: LOG_LEVEL
         value: INFO
       - key: AI_CACHE_TTL
         value: "900"
-      - key: CACHE_TTL_HOURS
-        value: "4"
       - key: CORS_ORIGINS
         value: "*"
