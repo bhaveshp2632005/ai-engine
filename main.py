@@ -17,6 +17,7 @@ Start: uvicorn main:app --host 0.0.0.0 --port 10000
 """
 
 import dataclasses
+import gc
 import logging
 import numpy as np
 import os
@@ -25,6 +26,7 @@ import time
 from contextlib import asynccontextmanager
 from pathlib    import Path
 from typing     import List, Optional
+import asyncio
 
 _HERE = Path(__file__).parent.resolve()
 if str(_HERE) not in sys.path:
@@ -225,77 +227,105 @@ async def analyze_quick(body: dict):
 
 
 @app.post("/predict")
-async def predict(req: PredictRequest, bg: BackgroundTasks):
+async def predict(req: PredictRequest):
     sym = req.symbol.upper().strip()
     ck  = f"predict:{sym}:{req.horizon}"
+
     if (cached := _cget(ck)):
         return JSONResponse({**cached, "fromCache": True})
+
     try:
-        t0   = time.time()
-        df   = svc.loader.get(sym)
-        info = svc.loader.get_info(sym)
-        cur  = info.get("currency", "USD")
+        # ⏱ Timeout wrapper (90 sec)
+        result = await asyncio.wait_for(
+            asyncio.get_running_loop().run_in_executor(
+                None, lambda: _run_predict(req, sym)
+            ),
+            timeout=90.0
+        )
 
-        regime_res  = svc.regime.detect(df)
-        regime_dict = _regime_dict(regime_res)
+        _cset(ck, result)
+        return JSONResponse({**result, "fromCache": False})
 
-        ensemble = LightEnsemble(horizon=req.horizon)
-        result   = ensemble.predict(sym, df, cur, req.skip_sentiment)
-        out      = result.to_dict()
-
-        out["confidence"]   = round(max(float(out.get("confidence", 50.0)), 52.0), 1)
-        out["marketRegime"] = regime_dict
-        out["meta"] = {
-            "symbol":        sym,
-            "companyName":   info.get("name",     sym),
-            "sector":        info.get("sector",   ""),
-            "currency":      cur,
-            "exchange":      info.get("exchange", ""),
-            "dataPoints":    len(df),
-            "latestDate":    str(df.index[-1].date()),
-            "computeTime":   round(time.time() - t0, 2),
-            "engineVersion": "4.0.0-prod",
-        }
-
-        if req.include_risk:
-            try:
-                risk_res    = svc.risk.assess(
-                    symbol           = sym, df=df,
-                    predicted_return = result.predicted_return / 100,
-                    market_regime    = regime_res.regime,
-                )
-                out["risk"] = risk_res.to_dict()
-            except Exception as e:
-                logger.warning("[predict] risk failed: %s", e)
-
-        if req.include_chart:
-            try:
-                df_f         = svc.fe.transform(df)
-                fig          = svc.viz.prediction_chart(df_f, result)
-                out["chart"] = svc.viz.fig_to_base64(fig)
-            except Exception as e:
-                logger.warning("[predict] chart failed: %s", e)
-
-        if req.include_backtest:
-            try:
-                df_f = svc.fe.transform(df)
-                sigs = svc.bt.generate_signals_from_model(
-                    df_f, ensemble.tabular_models, [], svc.fe)
-                bt_r = svc.bt.run(df, sigs)
-                out["backtest"] = bt_r.to_dict()
-            except Exception as e:
-                logger.warning("[predict] backtest failed: %s", e)
-
-        bg.add_task(ensemble.save, sym)
-        _cset(ck, out)
-        return JSONResponse({**out, "fromCache": False})
+    except asyncio.TimeoutError:
+        raise HTTPException(
+            504,
+            "Prediction timeout — try skipSentiment=true or lower lstmEpochs"
+        )
 
     except ValueError as ex:
         raise HTTPException(422, str(ex))
+
     except Exception as ex:
         logger.exception("[predict] %s", sym)
-        raise HTTPException(500, str(ex))
+        raise HTTPException(500, f"Prediction failed: {ex}")
 
+def _run_predict(req, sym):
+    """Sync function jo executor mein chalega."""
+    t0   = time.time()
+
+    df   = svc.loader.get(sym)
+    info = svc.loader.get_info(sym)
+    cur  = info.get("currency", "USD")
+
+    regime_res  = svc.regime.detect(df)
+    regime_dict = _regime_dict(regime_res)
+
+    ensemble = LightEnsemble(horizon=req.horizon)
+    result   = ensemble.predict(sym, df, cur, req.skip_sentiment)
+    out      = result.to_dict()
+
+    out["confidence"]   = round(max(float(out.get("confidence", 50.0)), 52.0), 1)
+    out["marketRegime"] = regime_dict
+
+    out["meta"] = {
+        "symbol":        sym,
+        "companyName":   info.get("name", sym),
+        "sector":        info.get("sector", ""),
+        "currency":      cur,
+        "exchange":      info.get("exchange", ""),
+        "dataPoints":    len(df),
+        "latestDate":    str(df.index[-1].date()),
+        "computeTime":   round(time.time() - t0, 2),
+        "engineVersion": "4.0.0-prod",
+    }
+
+    # Risk
+    if req.include_risk:
+        try:
+            risk_res = svc.risk.assess(
+                symbol=sym,
+                df=df,
+                predicted_return=result.predicted_return / 100,
+                market_regime=regime_res.regime,
+            )
+            out["risk"] = risk_res.to_dict()
+        except Exception as e:
+            logger.warning("[predict] risk failed: %s", e)
+
+    # Chart
+    if req.include_chart:
+        try:
+            df_f = svc.fe.transform(df)
+            out["chart"] = svc.viz.fig_to_base64(
+                svc.viz.prediction_chart(df_f, result)
+            )
+        except Exception as e:
+            logger.warning("[predict] chart failed: %s", e)
+
+    # Backtest
+    if req.include_backtest:
+        try:
+            df_f = svc.fe.transform(df)
+            sigs = svc.bt.generate_signals_from_model(
+                df_f, ensemble.tabular_models, [], svc.fe
+            )
+            bt_r = svc.bt.run(df, sigs)
+            out["backtest"] = bt_r.to_dict()
+        except Exception as e:
+            logger.warning("[predict] backtest failed: %s", e)
+        
+    gc.collect()
+    return out
 
 @app.get("/regime/{symbol}")
 async def regime(symbol: str):
