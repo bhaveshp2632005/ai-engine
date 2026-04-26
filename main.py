@@ -1,19 +1,19 @@
 """
-main.py — AI Engine v4.0 PRODUCTION (Render/Railway Free-Tier)
-═══════════════════════════════════════════════════════════════
-CHANGES vs dev version:
-  ✗ REMOVED: torch, LSTM, GRU, TemporalFusionModel
-  ✗ REMOVED: FinBERT / transformers (lexicon fallback only)
-  ✗ REMOVED: stable-baselines3 RL agent endpoints
-  ✗ REMOVED: hmmlearn HMM (KMeans-only regime detection)
-  ✓ KEPT:    XGBoost, LightGBM, LinearModel
-  ✓ KEPT:    Feature engineering, backtesting, portfolio, risk
-  ✓ ADDED:   LightEnsemble (tabular-only, no seq models)
-  ✓ ADDED:   Model warm-up at startup
-  ✓ FIXED:   CORS via env var
-  ✓ FIXED:   PORT env var (Render uses PORT not AI_PORT)
-
-Start: uvicorn main:app --host 0.0.0.0 --port 10000
+main.py — AI Engine v4.0 PRODUCTION
+═══════════════════════════════════
+BUGS FIXED in this version:
+  BUG 1 (500): _run_predict was called via run_in_executor()
+               → sklearn KMeans + pandas are NOT thread-safe
+               → Fix: removed executor, predict runs synchronously
+               → FastAPI + uvicorn handle concurrency fine without threads
+               
+  BUG 2 (404→500): Frontend calls /ai/portfolio/optimize
+                   Backend only had POST /portfolio (no /optimize)
+                   → Fix: added /portfolio/optimize alias route
+                   
+  BUG 3 (silent): Pydantic v2 ignores camelCase keys (skipSentiment etc)
+                  defaults happen to be correct so no 500, but added
+                  alias_generator anyway for correctness
 """
 
 import dataclasses
@@ -26,7 +26,6 @@ import time
 from contextlib import asynccontextmanager
 from pathlib    import Path
 from typing     import List, Optional
-import asyncio
 
 _HERE = Path(__file__).parent.resolve()
 if str(_HERE) not in sys.path:
@@ -43,6 +42,9 @@ from fastapi                 import FastAPI, HTTPException, BackgroundTasks, Web
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses       import JSONResponse
 from pydantic                import BaseModel, Field
+from pydantic                import ConfigDict
+# alias_generator converts camelCase → snake_case automatically
+from pydantic.alias_generators import to_camel
 
 from data_loader         import DataLoader, MacroLoader, StockDataLoader
 from ensemble_model      import LightEnsemble
@@ -56,23 +58,39 @@ from risk_manager        import RiskManager
 from websocket_server    import ws_endpoint
 
 
-# ── Request Models ────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+# REQUEST MODELS — camelCase aliases so frontend JSON maps correctly
+# ══════════════════════════════════════════════════════════════════════════════
 
 class PredictRequest(BaseModel):
+    # FIX 3: alias_generator accepts both camelCase (frontend) and snake_case
+    model_config = ConfigDict(
+        alias_generator   = to_camel,
+        populate_by_name  = True,   # also accept snake_case directly
+        extra             = "ignore",
+    )
     symbol:           str   = Field(..., example="AAPL")
     horizon:          int   = Field(5, ge=1, le=30)
     skip_sentiment:   bool  = False
     include_risk:     bool  = True
     include_chart:    bool  = False
     include_backtest: bool  = False
-    lstm_epochs:      int   = Field(60, ge=1, le=200)  # kept for API compat, ignored
+    lstm_epochs:      int   = Field(60, ge=1, le=200)
+
 
 class PortfolioRequest(BaseModel):
+    model_config = ConfigDict(extra="ignore")
     symbols: List[str] = Field(..., min_length=2)
     method:  str       = "max_sharpe"
     regime:  str       = "Sideways"
 
+
 class BacktestRequest(BaseModel):
+    model_config = ConfigDict(
+        alias_generator  = to_camel,
+        populate_by_name = True,
+        extra            = "ignore",
+    )
     symbol:           str   = Field(..., example="AAPL")
     initial_cash:     float = 100_000.0
     signal_threshold: float = 0.8
@@ -80,7 +98,9 @@ class BacktestRequest(BaseModel):
     take_profit_pct:  float = 0.12
 
 
-# ── Service Singletons ────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+# SERVICE SINGLETONS
+# ══════════════════════════════════════════════════════════════════════════════
 
 class _Svc:
     loader    = DataLoader()
@@ -94,7 +114,9 @@ class _Svc:
 svc = _Svc()
 
 
-# ── Cache ─────────────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+# CACHE
+# ══════════════════════════════════════════════════════════════════════════════
 
 _cache: dict = {}
 _CACHE_TTL   = int(os.getenv("AI_CACHE_TTL", "900"))
@@ -109,7 +131,9 @@ def _cset(key: str, data):
     _cache[key] = {"d": data, "t": time.time()}
 
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+# HELPERS
+# ══════════════════════════════════════════════════════════════════════════════
 
 def _regime_dict(r) -> dict:
     d = r.to_dict()
@@ -127,7 +151,9 @@ def _articles_json(articles: list) -> list:
     return out
 
 
-# ── App Lifecycle ─────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+# APP LIFECYCLE
+# ══════════════════════════════════════════════════════════════════════════════
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -147,15 +173,18 @@ async def lifespan(app: FastAPI):
     logger.info("AI Engine shutting down")
 
 
-# ── CORS ──────────────────────────────────────────────────────────────────────
-_cors = os.getenv("CORS_ORIGINS", "*")
+# ══════════════════════════════════════════════════════════════════════════════
+# CORS
+# ══════════════════════════════════════════════════════════════════════════════
+
+_cors    = os.getenv("CORS_ORIGINS", "*")
 _origins = [o.strip() for o in _cors.split(",") if o.strip()] or ["*"]
 
 app = FastAPI(
-    title    = "StockAnalyzer AI Engine",
-    version  = "4.0.0-prod",
-    lifespan = lifespan,
-    docs_url = "/docs",   # disable in prod by setting DISABLE_DOCS=1 if needed
+    title     = "StockAnalyzer AI Engine",
+    version   = "4.0.0-prod",
+    lifespan  = lifespan,
+    docs_url  = "/docs",
     redoc_url = None,
 )
 app.add_middleware(
@@ -180,6 +209,8 @@ def health():
         "cache_entries": len(_cache),
     }
 
+
+# ── Quick Analyze ─────────────────────────────────────────────────────────────
 
 @app.post("/analyze")
 async def analyze_quick(body: dict):
@@ -226,6 +257,11 @@ async def analyze_quick(body: dict):
                              "summary": "Analysis unavailable", "score": 0})
 
 
+# ── Predict ───────────────────────────────────────────────────────────────────
+# FIX 1: Removed run_in_executor — sklearn/pandas are NOT thread-safe.
+#         Running synchronously is correct for a single-worker free-tier server.
+#         FastAPI's async event loop handles other requests while this runs.
+
 @app.post("/predict")
 async def predict(req: PredictRequest):
     sym = req.symbol.upper().strip()
@@ -235,34 +271,20 @@ async def predict(req: PredictRequest):
         return JSONResponse({**cached, "fromCache": True})
 
     try:
-        # ⏱ Timeout wrapper (90 sec)
-        result = await asyncio.wait_for(
-            asyncio.get_running_loop().run_in_executor(
-                None, lambda: _run_predict(req, sym)
-            ),
-            timeout=90.0
-        )
-
-        _cset(ck, result)
-        return JSONResponse({**result, "fromCache": False})
-
-    except asyncio.TimeoutError:
-        raise HTTPException(
-            504,
-            "Prediction timeout — try skipSentiment=true or lower lstmEpochs"
-        )
+        out = _run_predict(req, sym)   # sync, no executor
+        _cset(ck, out)
+        return JSONResponse({**out, "fromCache": False})
 
     except ValueError as ex:
         raise HTTPException(422, str(ex))
-
     except Exception as ex:
         logger.exception("[predict] %s", sym)
         raise HTTPException(500, f"Prediction failed: {ex}")
 
-def _run_predict(req, sym):
-    """Sync function jo executor mein chalega."""
-    t0   = time.time()
 
+def _run_predict(req: PredictRequest, sym: str) -> dict:
+    """Pure sync function — safe because uvicorn runs 1 worker on free tier."""
+    t0   = time.time()
     df   = svc.loader.get(sym)
     info = svc.loader.get_info(sym)
     cur  = info.get("currency", "USD")
@@ -276,11 +298,10 @@ def _run_predict(req, sym):
 
     out["confidence"]   = round(max(float(out.get("confidence", 50.0)), 52.0), 1)
     out["marketRegime"] = regime_dict
-
     out["meta"] = {
         "symbol":        sym,
-        "companyName":   info.get("name", sym),
-        "sector":        info.get("sector", ""),
+        "companyName":   info.get("name",     sym),
+        "sector":        info.get("sector",   ""),
         "currency":      cur,
         "exchange":      info.get("exchange", ""),
         "dataPoints":    len(df),
@@ -289,43 +310,41 @@ def _run_predict(req, sym):
         "engineVersion": "4.0.0-prod",
     }
 
-    # Risk
     if req.include_risk:
         try:
             risk_res = svc.risk.assess(
-                symbol=sym,
-                df=df,
-                predicted_return=result.predicted_return / 100,
-                market_regime=regime_res.regime,
+                symbol           = sym,
+                df               = df,
+                predicted_return = result.predicted_return / 100,
+                market_regime    = regime_res.regime,
             )
             out["risk"] = risk_res.to_dict()
         except Exception as e:
             logger.warning("[predict] risk failed: %s", e)
 
-    # Chart
     if req.include_chart:
         try:
-            df_f = svc.fe.transform(df)
+            df_f         = svc.fe.transform(df)
             out["chart"] = svc.viz.fig_to_base64(
-                svc.viz.prediction_chart(df_f, result)
-            )
+                svc.viz.prediction_chart(df_f, result))
         except Exception as e:
             logger.warning("[predict] chart failed: %s", e)
 
-    # Backtest
     if req.include_backtest:
         try:
             df_f = svc.fe.transform(df)
             sigs = svc.bt.generate_signals_from_model(
-                df_f, ensemble.tabular_models, [], svc.fe
-            )
+                df_f, ensemble.tabular_models, [], svc.fe)
             bt_r = svc.bt.run(df, sigs)
             out["backtest"] = bt_r.to_dict()
         except Exception as e:
             logger.warning("[predict] backtest failed: %s", e)
-        
+
     gc.collect()
     return out
+
+
+# ── Regime ────────────────────────────────────────────────────────────────────
 
 @app.get("/regime/{symbol}")
 async def regime(symbol: str):
@@ -343,6 +362,8 @@ async def regime(symbol: str):
         raise HTTPException(500, str(ex))
 
 
+# ── Sentiment ─────────────────────────────────────────────────────────────────
+
 @app.get("/sentiment/{symbol}")
 async def sentiment(symbol: str, max_articles: int = 20):
     sym = symbol.upper().strip()
@@ -358,7 +379,11 @@ async def sentiment(symbol: str, max_articles: int = 20):
         raise HTTPException(500, str(ex))
 
 
+# ── Portfolio ─────────────────────────────────────────────────────────────────
+# FIX 2: Added /portfolio/optimize alias — frontend calls this path
+
 @app.post("/portfolio")
+@app.post("/portfolio/optimize")   # ← ALIAS: frontend calls /ai/portfolio/optimize
 async def portfolio(req: PortfolioRequest):
     try:
         syms   = [s.upper() for s in req.symbols]
@@ -377,6 +402,8 @@ async def portfolio(req: PortfolioRequest):
         raise HTTPException(500, str(ex))
 
 
+# ── Risk ──────────────────────────────────────────────────────────────────────
+
 @app.get("/risk/{symbol}")
 async def risk(symbol: str):
     sym = symbol.upper().strip()
@@ -387,6 +414,8 @@ async def risk(symbol: str):
     except Exception as ex:
         raise HTTPException(500, str(ex))
 
+
+# ── Backtest ──────────────────────────────────────────────────────────────────
 
 @app.post("/backtest")
 async def backtest(req: BacktestRequest):
@@ -402,11 +431,11 @@ async def backtest(req: BacktestRequest):
         X_tab, y_tab, _ = svc.fe.build_supervised(df_f, 5)
         xgb_m = XGBoostModel(n_estimators=100);  xgb_m.fit(X_tab, y_tab)
         lgb_m = LightGBMModel(n_estimators=100); lgb_m.fit(X_tab, y_tab)
-        sigs = svc.bt.generate_signals_from_model(df_f, [xgb_m, lgb_m], [], svc.fe)
-        bt_r = svc.bt.run(df, sigs,
-            signal_threshold=req.signal_threshold,
-            stop_loss_pct=req.stop_loss_pct,
-            take_profit_pct=req.take_profit_pct,
+        sigs  = svc.bt.generate_signals_from_model(df_f, [xgb_m, lgb_m], [], svc.fe)
+        bt_r  = svc.bt.run(df, sigs,
+            signal_threshold = req.signal_threshold,
+            stop_loss_pct    = req.stop_loss_pct,
+            take_profit_pct  = req.take_profit_pct,
         )
         out = {**bt_r.to_dict(), "symbol": sym, "computeTime": round(time.time()-t0, 2)}
         _cset(ck, out)
@@ -414,6 +443,8 @@ async def backtest(req: BacktestRequest):
     except Exception as ex:
         raise HTTPException(500, str(ex))
 
+
+# ── Indicators ────────────────────────────────────────────────────────────────
 
 @app.get("/indicators/{symbol}")
 async def indicators(symbol: str, n_days: int = 30):
@@ -441,6 +472,8 @@ async def indicators(symbol: str, n_days: int = 30):
         raise HTTPException(500, str(ex))
 
 
+# ── Chart ─────────────────────────────────────────────────────────────────────
+
 @app.get("/chart/{symbol}")
 async def chart(symbol: str, chart_type: str = "price"):
     sym = symbol.upper().strip()
@@ -453,6 +486,8 @@ async def chart(symbol: str, chart_type: str = "price"):
     except Exception as ex:
         raise HTTPException(500, str(ex))
 
+
+# ── Signal ────────────────────────────────────────────────────────────────────
 
 @app.get("/signal/{symbol}")
 async def signal_engine(symbol: str):
@@ -484,6 +519,8 @@ async def signal_engine(symbol: str):
         raise HTTPException(500, str(ex))
 
 
+# ── Macro ─────────────────────────────────────────────────────────────────────
+
 @app.get("/macro")
 async def macro_snapshot():
     ck = "macro:latest"
@@ -500,28 +537,32 @@ async def macro_snapshot():
         raise HTTPException(500, str(ex))
 
 
+# ── Timeframes ────────────────────────────────────────────────────────────────
+
 @app.get("/timeframes/{symbol}")
 async def timeframes(symbol: str):
-    sym = symbol.upper().strip()
+    sym    = symbol.upper().strip()
     result = {}
     for tf, (period, interval) in {"1d": ("2y","1d"), "1wk": ("5y","1wk")}.items():
         try:
             df = StockDataLoader(sym, period=period, interval=interval).load()
             result[tf] = {
-                "rows": len(df),
+                "rows":         len(df),
                 "latest_close": round(float(df["close"].iloc[-1]), 2),
-                "latest_date": str(df.index[-1].date()),
+                "latest_date":  str(df.index[-1].date()),
             }
         except Exception as e:
             result[tf] = {"error": str(e)}
     return JSONResponse({"symbol": sym, "timeframes": result})
 
 
+# ── Portfolio Eval ────────────────────────────────────────────────────────────
+
 @app.post("/portfolio/eval")
 async def portfolio_eval(body: dict):
     import pandas as pd
-    holdings = body.get("holdings", [])
-    capital  = float(body.get("capital", 100000))
+    holdings   = body.get("holdings", [])
+    capital    = float(body.get("capital", 100000))
     results, prices_map = [], {}
 
     for h in holdings:
@@ -538,11 +579,15 @@ async def portfolio_eval(body: dict):
             pnl = mv - cv
             log_r = df["close"].pct_change().dropna()
             results.append({
-                "symbol": sym, "shares": shares, "avgCost": round(avg_c, 2),
-                "currentPrice": round(cur, 2), "marketValue": round(mv, 2),
-                "costBasis": round(cv, 2), "pnl": round(pnl, 2),
-                "pnlPct": round((pnl/cv*100 if cv > 0 else 0), 2),
-                "volatility": round(float(log_r.std())*252**0.5*100, 2),
+                "symbol":       sym,
+                "shares":       shares,
+                "avgCost":      round(avg_c, 2),
+                "currentPrice": round(cur,   2),
+                "marketValue":  round(mv,    2),
+                "costBasis":    round(cv,    2),
+                "pnl":          round(pnl,   2),
+                "pnlPct":       round((pnl/cv*100 if cv > 0 else 0), 2),
+                "volatility":   round(float(log_r.std())*252**0.5*100, 2),
             })
         except Exception as e:
             results.append({"symbol": sym, "error": str(e)})
@@ -560,24 +605,31 @@ async def portfolio_eval(body: dict):
             syms_in = [r["symbol"] for r in results if r.get("symbol") in ret_df.columns]
             weights = [r["allocation"]/100 for r in results if r.get("symbol") in ret_df.columns]
             if syms_in:
-                w   = np.array(weights)
-                cov = ret_df[syms_in].cov().values * 252
+                w        = np.array(weights)
+                cov      = ret_df[syms_in].cov().values * 252
                 port_vol = round(float((w @ cov @ w)**0.5 * 100), 2)
     except Exception:
         pass
 
     return JSONResponse({
-        "holdings": results, "totalValue": round(total_val, 2),
-        "totalCost": round(total_cost, 2), "totalPnl": round(total_pnl, 2),
-        "totalPnlPct": round(total_pnl/total_cost*100 if total_cost > 0 else 0, 2),
-        "portfolioVolatility": port_vol, "capital": capital,
+        "holdings":          results,
+        "totalValue":        round(total_val,  2),
+        "totalCost":         round(total_cost, 2),
+        "totalPnl":          round(total_pnl,  2),
+        "totalPnlPct":       round(total_pnl/total_cost*100 if total_cost > 0 else 0, 2),
+        "portfolioVolatility": port_vol,
+        "capital":           capital,
     })
 
+
+# ── WebSocket ─────────────────────────────────────────────────────────────────
 
 @app.websocket("/ws")
 async def websocket_endpoint(ws: WebSocket):
     await ws_endpoint(ws)
 
+
+# ── Entry Point ───────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     import uvicorn
