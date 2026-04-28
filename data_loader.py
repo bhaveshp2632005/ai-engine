@@ -1,5 +1,5 @@
 """
-data_loader.py — Stock data pipeline PRODUCTION v4.1
+data_loader.py — Stock data pipeline PRODUCTION v4.2
 ═════════════════════════════════════════════════════
 SYMBOL SUPPORT — all asset classes:
   ✓ US Stocks/ETFs        AAPL, SPY, QQQ
@@ -9,6 +9,7 @@ SYMBOL SUPPORT — all asset classes:
   ✓ Commodities/Futures   GC=F, CL=F, SI=F, NG=F
   ✓ India NSE/BSE         RELIANCE.NS, TCS.NS, INFY.BO
   ✓ India Indices         ^NSEI, ^BSESN, NIFTY50, SENSEX
+                          NIFTY50.NS, SENSEX.BO  ← v4.2 fix
   ✓ UK / Ireland          HSBA.L, BP.L
   ✓ Canada                SHOP.TO, BB.V
   ✓ Japan                 7203.T, 6758.T
@@ -48,16 +49,17 @@ DATA SOURCES (priority order):
   3. yfinance  — final fallback (direct Yahoo Finance v8 API)
   4. Stale cache — last resort if all live sources fail
 
-CHANGES vs older version:
-  ✓ FIXED:  DataLoader.get() now accepts interval= kwarg
-  ✓ FIXED:  All HTTP timeouts reduced to 10s
-  ✓ FIXED:  MacroLoader snapshot() catches all errors gracefully
-  ✓ FIXED:  Complete _stooq_sym() with 40+ exchange suffix mappings
-  ✓ FIXED:  Complete _av_sym() with correct AlphaVantage suffixes
-  ✓ FIXED:  Forex =X suffix → Stooq .fx + AV FX_DAILY endpoint
-  ✓ FIXED:  Crypto -USD → Stooq .cx + AV DIGITAL_CURRENCY_DAILY
-  ✓ FIXED:  Frankfurt .F stock tickers (SIE.F, BMW.F) → .DE unambiguously
-  ✓ FIXED:  All Scandinavian, EM, and APAC exchanges mapped correctly
+CHANGES vs v4.1:
+  ✓ FIXED:  NIFTY50.NS / SENSEX.BO / NIFTY.NS alias normalisation in
+            _stooq_sym() — callers that append .NS/.BO to index names no
+            longer fall through to the suffix table and produce a bad Stooq
+            symbol, causing "Expected 1 fields … saw 2" CSV parse errors.
+  ✓ FIXED:  _from_stooq() now wraps pd.read_csv in try/except and raises a
+            descriptive ValueError (including raw response snippet) instead
+            of the opaque pandas C-engine tokenisation error.
+  ✓ FIXED:  ^AXJO exact-map entry corrected — was wrongly mapped to ^ATX
+            (Austrian index); now mapped to ^AXJO passthrough (Stooq
+            supports it directly). Added note about ^ATX ambiguity.
 """
 
 import io, logging, os, time
@@ -96,6 +98,9 @@ def _dates(period: str):
 # ══════════════════════════════════════════════════════════════════════════════
 #
 # Priority order (first match wins):
+#   0. Index/alias prefix normalisation  ← NEW in v4.2
+#      Strips exchange suffixes from well-known index aliases so that
+#      NIFTY50.NS, NIFTY50, and ^NSEI all resolve to the same Stooq symbol.
 #   1. Exact hardcoded map  (special indices, well-known aliases)
 #   2. Index passthrough    (^ prefix → as-is)
 #   3. Forex                (=X suffix → .fx)
@@ -166,12 +171,36 @@ _YF_TO_STOOQ: list[tuple[str, str]] = sorted([
 ], key=lambda x: -len(x[0]))   # ← longest suffix first — critical for .TWO vs .T etc.
 
 
+# ── v4.2: index/alias prefix normalisation ────────────────────────────────────
+#
+# Maps a bare alias prefix → its canonical Stooq symbol.
+# Matched when the incoming symbol equals the alias exactly, OR starts with
+# the alias followed by "." or "-" (e.g. NIFTY50.NS, NIFTY50-USD).
+# The delimiter check prevents e.g. "NIFTY500.NS" from matching "NIFTY50".
+#
+# Sorted longest-first so more-specific prefixes (NIFTY50) are checked
+# before shorter ones (NIFTY) and can't be shadowed.
+_INDEX_ALIAS_PREFIX: list[tuple[str, str]] = sorted([
+    ("NIFTY50",  "^NII50"),   # Nifty 50 — canonical
+    ("NIFTY500", "^NII500"),  # Nifty 500 (if Stooq carries it)
+    ("NIFTY",    "^NII50"),   # bare "NIFTY" alias
+    ("SENSEX",   "^BSE"),     # BSE Sensex
+    ("BANKNIFTY","^NSEBANK"), # Bank Nifty (Stooq symbol may vary)
+], key=lambda x: -len(x[0]))  # longest first
+
+
 def _stooq_sym(symbol: str) -> str:
     """
     Translate a yfinance-style ticker to its Stooq equivalent.
     Never raises — always returns a best-effort string.
     """
     s = symbol.upper().strip()
+
+    # 0. Index/alias prefix normalisation (v4.2)
+    #    Handles NIFTY50.NS, NIFTY50, SENSEX.BO, SENSEX, BANKNIFTY.NS, …
+    for alias, stooq_canonical in _INDEX_ALIAS_PREFIX:
+        if s == alias or s.startswith(alias + ".") or s.startswith(alias + "-"):
+            return stooq_canonical
 
     # 1. Exact hardcoded map — special indices and well-known aliases
     _exact: dict[str, str] = {
@@ -190,14 +219,14 @@ def _stooq_sym(symbol: str) -> str:
         "DX-Y.NYB": "DXY.F",    # US Dollar Index
         "^NSEI":    "^NII50",   # Nifty 50
         "^BSESN":   "^BSE",     # BSE Sensex
-        "NIFTY50":  "^NII50",
-        "SENSEX":   "^BSE",
         "^FTSE":    "^FTM",     # FTSE 100
         "^GDAXI":   "^DAX",     # DAX
         "^FCHI":    "^CAC",     # CAC 40
         "^N225":    "^NKX",     # Nikkei 225
         "^HSI":     "^HSI",     # Hang Seng
-        "^AXJO":    "^ATX",     # ASX 200 (Stooq uses ^ATX for Austria too, ^AXJO may not exist)
+        # NOTE: ^AXJO (ASX 200) passes through to Stooq as-is.
+        # ^ATX is the Austrian ATX index on Stooq — do NOT conflate with ASX 200.
+        "^AXJO":    "^AXJO",    # ASX 200 — Stooq supports directly
         "^KS11":    "^KS11",    # KOSPI
         "^TWII":    "^TWII",    # Taiwan TAIEX
         "^STI":     "^STI",     # Straits Times Index
@@ -306,6 +335,15 @@ def _av_sym(symbol: str) -> str:
     original symbol, which is cleaner. This just returns the symbol string.
     """
     s = symbol.upper().strip()
+
+    # Normalise index aliases first (mirrors step 0 in _stooq_sym)
+    # AV doesn't have these indices, but normalisation prevents AV from
+    # being called with NIFTY50.NS and treating it as an equity.
+    for alias, _ in _INDEX_ALIAS_PREFIX:
+        if s == alias or s.startswith(alias + ".") or s.startswith(alias + "-"):
+            # Return a clearly invalid AV symbol so _from_alphavantage() fails
+            # fast and we fall through to yfinance rather than hitting AV quota.
+            return "__INDEX_NOT_SUPPORTED__"
 
     # Forex: EURUSD=X → "EUR/USD"
     if s.endswith("=X"):
@@ -453,7 +491,15 @@ class StockDataLoader:
         text   = r.text.strip()
         if len(text) < 50 or "No data" in text or "Exceeded" in text:
             raise ValueError(f"Stooq: empty/blocked response for symbol '{sym}'")
-        df = pd.read_csv(io.StringIO(text))
+        # v4.2: wrap CSV parsing so callers get a descriptive error instead of
+        # an opaque pandas C-engine tokenisation traceback.
+        try:
+            df = pd.read_csv(io.StringIO(text))
+        except Exception as e:
+            raise ValueError(
+                f"Stooq: CSV parse error for symbol '{sym}' "
+                f"(raw={text[:120]!r}): {e}"
+            ) from e
         df.columns = [c.strip().lower() for c in df.columns]
         df["date"] = pd.to_datetime(df["date"])
         return self._clean(df.set_index("date").sort_index())
@@ -463,6 +509,12 @@ class StockDataLoader:
     def _from_alphavantage(self, key: str) -> pd.DataFrame:
         s = self.symbol.upper()
         av_symbol = _av_sym(self.symbol)
+
+        # Fast-fail for symbols that AV does not support (e.g. Indian indices)
+        if av_symbol == "__INDEX_NOT_SUPPORTED__":
+            raise ValueError(
+                f"AV: symbol '{self.symbol}' is a known index not supported by AlphaVantage"
+            )
 
         # Route to the correct AV endpoint based on asset class
         if s.endswith("=X"):
