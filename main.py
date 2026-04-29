@@ -200,7 +200,7 @@ app.add_middleware(
 # ENDPOINTS
 # ══════════════════════════════════════════════════════════════════════════════
 
-@app.get("/health")
+@app.api_route("/health", methods=["GET", "HEAD"])
 def health():
     return {
         "status":        "ok",
@@ -208,7 +208,6 @@ def health():
         "mode":          "lightweight",
         "cache_entries": len(_cache),
     }
-
 
 # ── Quick Analyze ─────────────────────────────────────────────────────────────
 
