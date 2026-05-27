@@ -1,19 +1,14 @@
 """
-main.py — AI Engine v4.0 PRODUCTION
-═══════════════════════════════════
-BUGS FIXED in this version:
-  BUG 1 (500): _run_predict was called via run_in_executor()
-               → sklearn KMeans + pandas are NOT thread-safe
-               → Fix: removed executor, predict runs synchronously
-               → FastAPI + uvicorn handle concurrency fine without threads
-               
-  BUG 2 (404→500): Frontend calls /ai/portfolio/optimize
-                   Backend only had POST /portfolio (no /optimize)
-                   → Fix: added /portfolio/optimize alias route
-                   
-  BUG 3 (silent): Pydantic v2 ignores camelCase keys (skipSentiment etc)
-                  defaults happen to be correct so no 500, but added
-                  alias_generator anyway for correctness
+main.py — AI Engine v4.4 PRODUCTION
+════════════════════════════════════
+FIXES vs v4.0:
+  FIX 1 (500 index): _canonicalise() called at the top of every endpoint
+         that takes a symbol. SENSEX.NS / NIFTY50.NS → ^BSESN / ^NSEI
+         before the data loader ever sees the symbol.
+  FIX 2 (500 thread): _run_predict() runs synchronously — no executor.
+  FIX 3 (404 portfolio): /portfolio/optimize alias route added.
+  FIX 4 (camelCase): Pydantic alias_generator accepts both camelCase
+         (frontend) and snake_case field names.
 """
 
 import dataclasses
@@ -41,12 +36,12 @@ logger = logging.getLogger("ai-engine")
 from fastapi                 import FastAPI, HTTPException, BackgroundTasks, WebSocket
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses       import JSONResponse
-from pydantic                import BaseModel, Field
-from pydantic                import ConfigDict
-# alias_generator converts camelCase → snake_case automatically
+from pydantic                import BaseModel, Field, ConfigDict
 from pydantic.alias_generators import to_camel
 
-from data_loader         import DataLoader, MacroLoader, StockDataLoader
+# Import _canonicalise so every endpoint can normalise at the boundary
+from data_loader         import (DataLoader, MacroLoader, StockDataLoader,
+                                 _canonicalise)
 from ensemble_model      import LightEnsemble
 from feature_engineering import FeatureEngineer
 from sentiment_analysis  import SentimentAnalyzer
@@ -59,15 +54,14 @@ from websocket_server    import ws_endpoint
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# REQUEST MODELS — camelCase aliases so frontend JSON maps correctly
+# REQUEST MODELS
 # ══════════════════════════════════════════════════════════════════════════════
 
 class PredictRequest(BaseModel):
-    # FIX 3: alias_generator accepts both camelCase (frontend) and snake_case
     model_config = ConfigDict(
-        alias_generator   = to_camel,
-        populate_by_name  = True,   # also accept snake_case directly
-        extra             = "ignore",
+        alias_generator  = to_camel,
+        populate_by_name = True,
+        extra            = "ignore",
     )
     symbol:           str   = Field(..., example="AAPL")
     horizon:          int   = Field(5, ge=1, le=30)
@@ -118,14 +112,16 @@ svc = _Svc()
 # CACHE
 # ══════════════════════════════════════════════════════════════════════════════
 
-_cache: dict = {}
-_CACHE_TTL   = int(os.getenv("AI_CACHE_TTL", "900"))
+_cache:    dict = {}
+_CACHE_TTL      = int(os.getenv("AI_CACHE_TTL", "900"))
+
 
 def _cget(key: str):
     e = _cache.get(key)
     if e and (time.time() - e["t"]) < _CACHE_TTL:
         return e["d"]
     return None
+
 
 def _cset(key: str, data):
     _cache[key] = {"d": data, "t": time.time()}
@@ -140,6 +136,7 @@ def _regime_dict(r) -> dict:
     if "currentRegime" not in d:
         d["currentRegime"] = d.get("regime", "Sideways")
     return d
+
 
 def _articles_json(articles: list) -> list:
     out = []
@@ -157,13 +154,13 @@ def _articles_json(articles: list) -> list:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    logger.info("AI Engine v4.0-prod starting …")
+    logger.info("AI Engine v4.4-prod starting…")
     try:
         import pandas as pd
         dummy = pd.DataFrame({
-            "open": [100.0]*300, "high": [101.0]*300,
-            "low": [99.0]*300, "close": [100.5]*300,
-            "volume": [1_000_000]*300,
+            "open":   [100.0] * 300, "high":   [101.0] * 300,
+            "low":    [99.0]  * 300, "close":  [100.5] * 300,
+            "volume": [1_000_000]  * 300,
         })
         svc.fe.transform(dummy)
         logger.info("FeatureEngineer warm-up OK")
@@ -182,7 +179,7 @@ _origins = [o.strip() for o in _cors.split(",") if o.strip()] or ["*"]
 
 app = FastAPI(
     title     = "StockAnalyzer AI Engine",
-    version   = "4.0.0-prod",
+    version   = "4.4.0-prod",
     lifespan  = lifespan,
     docs_url  = "/docs",
     redoc_url = None,
@@ -204,18 +201,18 @@ app.add_middleware(
 def health():
     return {
         "status":        "ok",
-        "version":       "4.0.0-prod",
-        "mode":          "lightweight",
+        "version":       "4.4.0-prod",
         "cache_entries": len(_cache),
     }
+
 
 # ── Quick Analyze ─────────────────────────────────────────────────────────────
 
 @app.post("/analyze")
 async def analyze_quick(body: dict):
-    """Fast rule-based signal — always < 1s, no ML training."""
+    """Fast rule-based signal — always < 1 s, no ML training."""
     try:
-        sym     = (body.get("symbol") or "UNKNOWN").upper()
+        sym     = _canonicalise(body.get("symbol") or "UNKNOWN")
         candles = body.get("chart") or body.get("candles") or []
         import pandas as pd
         if candles and len(candles) >= 20:
@@ -236,57 +233,63 @@ async def analyze_quick(body: dict):
         trend    = float(last.get("close_vs_ma50", 0))
 
         score, reasons = 0.0, []
-        if rsi < 35:        score += 2; reasons.append(f"RSI oversold ({rsi:.0f})")
-        elif rsi > 65:      score -= 2; reasons.append(f"RSI overbought ({rsi:.0f})")
-        if macd > macd_sig: score += 1; reasons.append("MACD bullish")
-        else:               score -= 1; reasons.append("MACD bearish")
-        if bb_pct < 0.2:    score += 1; reasons.append("Near lower BB")
-        elif bb_pct > 0.8:  score -= 1; reasons.append("Near upper BB")
-        if trend > 0.02:    score += 1; reasons.append("Above MA50")
-        elif trend < -0.02: score -= 1; reasons.append("Below MA50")
+        if   rsi < 35:        score += 2; reasons.append(f"RSI oversold ({rsi:.0f})")
+        elif rsi > 65:        score -= 2; reasons.append(f"RSI overbought ({rsi:.0f})")
+        if   macd > macd_sig: score += 1; reasons.append("MACD bullish")
+        else:                 score -= 1; reasons.append("MACD bearish")
+        if   bb_pct < 0.2:    score += 1; reasons.append("Near lower BB")
+        elif bb_pct > 0.8:    score -= 1; reasons.append("Near upper BB")
+        if   trend > 0.02:    score += 1; reasons.append("Above MA50")
+        elif trend < -0.02:   score -= 1; reasons.append("Below MA50")
 
         action     = "BUY" if score >= 2 else ("SELL" if score <= -2 else "HOLD")
         confidence = min(95, max(30, 50 + abs(score) * 10))
-        return JSONResponse({"action": action, "confidence": int(confidence),
-                             "summary": " | ".join(reasons) or "Mixed signals",
-                             "score": round(score, 2)})
+        return JSONResponse({
+            "action":     action,
+            "confidence": int(confidence),
+            "summary":    " | ".join(reasons) or "Mixed signals",
+            "score":      round(score, 2),
+        })
     except Exception as ex:
         logger.warning("[analyze] %s", ex)
-        return JSONResponse({"action": "HOLD", "confidence": 30,
-                             "summary": "Analysis unavailable", "score": 0})
+        return JSONResponse({
+            "action": "HOLD", "confidence": 30,
+            "summary": "Analysis unavailable", "score": 0,
+        })
 
 
 # ── Predict ───────────────────────────────────────────────────────────────────
-# FIX 1: Removed run_in_executor — sklearn/pandas are NOT thread-safe.
-#         Running synchronously is correct for a single-worker free-tier server.
-#         FastAPI's async event loop handles other requests while this runs.
 
 @app.post("/predict")
 async def predict(req: PredictRequest):
-    sym = req.symbol.upper().strip()
+    # Canonicalise at the API boundary — SENSEX.NS → ^BSESN etc.
+    sym = _canonicalise(req.symbol)
     ck  = f"predict:{sym}:{req.horizon}"
+
+    logger.info("[predict] symbol='%s' → canonical='%s' horizon=%dd",
+                req.symbol, sym, req.horizon)
 
     if (cached := _cget(ck)):
         return JSONResponse({**cached, "fromCache": True})
 
     try:
-        out = _run_predict(req, sym)   # sync, no executor
+        out = _run_predict(req, sym)
         _cset(ck, out)
         return JSONResponse({**out, "fromCache": False})
-
     except ValueError as ex:
         raise HTTPException(422, str(ex))
     except Exception as ex:
-        logger.exception("[predict] %s", sym)
-        raise HTTPException(500, f"Prediction failed: {ex}")
+        logger.exception("[predict] FAILED for sym=%s (original=%s)", sym, req.symbol)
+        raise HTTPException(500, f"Prediction failed for {sym}: {ex}")
 
 
 def _run_predict(req: PredictRequest, sym: str) -> dict:
-    """Pure sync function — safe because uvicorn runs 1 worker on free tier."""
+    """sym is already canonicalised — safe to pass directly to data loader."""
     t0   = time.time()
     df   = svc.loader.get(sym)
     info = svc.loader.get_info(sym)
-    cur  = info.get("currency", "USD")
+    cur  = info.get("currency",
+                    "INR" if sym in ("^NSEI", "^BSESN", "^NSEBANK") else "USD")
 
     regime_res  = svc.regime.detect(df)
     regime_dict = _regime_dict(regime_res)
@@ -306,7 +309,7 @@ def _run_predict(req: PredictRequest, sym: str) -> dict:
         "dataPoints":    len(df),
         "latestDate":    str(df.index[-1].date()),
         "computeTime":   round(time.time() - t0, 2),
-        "engineVersion": "4.0.0-prod",
+        "engineVersion": "4.4.0-prod",
     }
 
     if req.include_risk:
@@ -347,7 +350,7 @@ def _run_predict(req: PredictRequest, sym: str) -> dict:
 
 @app.get("/regime/{symbol}")
 async def regime(symbol: str):
-    sym = symbol.upper().strip()
+    sym = _canonicalise(symbol)
     ck  = f"regime:{sym}"
     if (cached := _cget(ck)):
         return JSONResponse({**cached, "fromCache": True})
@@ -365,7 +368,7 @@ async def regime(symbol: str):
 
 @app.get("/sentiment/{symbol}")
 async def sentiment(symbol: str, max_articles: int = 20):
-    sym = symbol.upper().strip()
+    sym = _canonicalise(symbol)
     ck  = f"sent:{sym}"
     if (cached := _cget(ck)):
         return JSONResponse({**cached, "fromCache": True})
@@ -379,13 +382,12 @@ async def sentiment(symbol: str, max_articles: int = 20):
 
 
 # ── Portfolio ─────────────────────────────────────────────────────────────────
-# FIX 2: Added /portfolio/optimize alias — frontend calls this path
 
 @app.post("/portfolio")
-@app.post("/portfolio/optimize")   # ← ALIAS: frontend calls /ai/portfolio/optimize
+@app.post("/portfolio/optimize")   # alias — frontend calls /ai/portfolio/optimize
 async def portfolio(req: PortfolioRequest):
     try:
-        syms   = [s.upper() for s in req.symbols]
+        syms   = [_canonicalise(s) for s in req.symbols]
         prices = {s: svc.loader.get(s) for s in syms}
         opt    = PortfolioOptimizer(symbols=syms)
         result = opt.optimize(prices, method=req.method)
@@ -405,7 +407,7 @@ async def portfolio(req: PortfolioRequest):
 
 @app.get("/risk/{symbol}")
 async def risk(symbol: str):
-    sym = symbol.upper().strip()
+    sym = _canonicalise(symbol)
     try:
         df  = svc.loader.get(sym)
         res = svc.risk.assess(symbol=sym, df=df)
@@ -418,7 +420,7 @@ async def risk(symbol: str):
 
 @app.post("/backtest")
 async def backtest(req: BacktestRequest):
-    sym = req.symbol.upper().strip()
+    sym = _canonicalise(req.symbol)
     ck  = f"bt:{sym}:{req.signal_threshold}"
     if (cached := _cget(ck)):
         return JSONResponse({**cached, "fromCache": True})
@@ -430,13 +432,19 @@ async def backtest(req: BacktestRequest):
         X_tab, y_tab, _ = svc.fe.build_supervised(df_f, 5)
         xgb_m = XGBoostModel(n_estimators=100);  xgb_m.fit(X_tab, y_tab)
         lgb_m = LightGBMModel(n_estimators=100); lgb_m.fit(X_tab, y_tab)
-        sigs  = svc.bt.generate_signals_from_model(df_f, [xgb_m, lgb_m], [], svc.fe)
-        bt_r  = svc.bt.run(df, sigs,
+        sigs  = svc.bt.generate_signals_from_model(
+            df_f, [xgb_m, lgb_m], [], svc.fe)
+        bt_r  = svc.bt.run(
+            df, sigs,
             signal_threshold = req.signal_threshold,
             stop_loss_pct    = req.stop_loss_pct,
             take_profit_pct  = req.take_profit_pct,
         )
-        out = {**bt_r.to_dict(), "symbol": sym, "computeTime": round(time.time()-t0, 2)}
+        out = {
+            **bt_r.to_dict(),
+            "symbol":      sym,
+            "computeTime": round(time.time() - t0, 2),
+        }
         _cset(ck, out)
         return JSONResponse({**out, "fromCache": False})
     except Exception as ex:
@@ -447,7 +455,7 @@ async def backtest(req: BacktestRequest):
 
 @app.get("/indicators/{symbol}")
 async def indicators(symbol: str, n_days: int = 30):
-    sym = symbol.upper().strip()
+    sym = _canonicalise(symbol)
     ck  = f"ind:{sym}:{n_days}"
     if (cached := _cget(ck)):
         return JSONResponse({**cached, "fromCache": True})
@@ -461,8 +469,9 @@ async def indicators(symbol: str, n_days: int = 30):
             pass
         out = {
             "symbol": sym, "n_days": n_days,
-            "latest": {k: round(float(v), 4) for k, v in df_f.iloc[-1].items()
-                      if not hasattr(v, "__len__")},
+            "latest": {k: round(float(v), 4)
+                       for k, v in df_f.iloc[-1].items()
+                       if not hasattr(v, "__len__")},
             "chart": chart,
         }
         _cset(ck, out)
@@ -475,13 +484,15 @@ async def indicators(symbol: str, n_days: int = 30):
 
 @app.get("/chart/{symbol}")
 async def chart(symbol: str, chart_type: str = "price"):
-    sym = symbol.upper().strip()
+    sym = _canonicalise(symbol)
     try:
         df   = svc.loader.get(sym)
         df_f = svc.fe.transform(df)
-        fig  = svc.viz.indicator_chart(df_f, sym) if chart_type == "indicator" \
-               else svc.viz.price_chart(df_f, sym)
-        return JSONResponse({"symbol": sym, "chart": svc.viz.fig_to_base64(fig)})
+        fig  = (svc.viz.indicator_chart(df_f, sym)
+                if chart_type == "indicator"
+                else svc.viz.price_chart(df_f, sym))
+        return JSONResponse({"symbol": sym,
+                             "chart":  svc.viz.fig_to_base64(fig)})
     except Exception as ex:
         raise HTTPException(500, str(ex))
 
@@ -490,7 +501,7 @@ async def chart(symbol: str, chart_type: str = "price"):
 
 @app.get("/signal/{symbol}")
 async def signal_engine(symbol: str):
-    sym = symbol.upper().strip()
+    sym = _canonicalise(symbol)
     ck  = f"signal:{sym}"
     if (cached := _cget(ck)):
         return JSONResponse({**cached, "fromCache": True})
@@ -510,28 +521,13 @@ async def signal_engine(symbol: str):
             sig["sentiment"] = sd
         except Exception:
             sig["sentiment"] = {"label": "Neutral", "score": 0, "confidence": 0}
-        out = {**sig, "symbol": sym,
-               "currentPrice": round(float(df["close"].iloc[-1]), 2)}
+        out = {
+            **sig,
+            "symbol":       sym,
+            "currentPrice": round(float(df["close"].iloc[-1]), 2),
+        }
         _cset(ck, out)
         return JSONResponse({**out, "fromCache": False})
-    except Exception as ex:
-        raise HTTPException(500, str(ex))
-
-
-# ── Macro ─────────────────────────────────────────────────────────────────────
-
-@app.get("/macro")
-async def macro_snapshot():
-    ck = "macro:latest"
-    if (cached := _cget(ck)):
-        return JSONResponse({**cached, "fromCache": True})
-    try:
-        snap = MacroLoader().snapshot()
-        vix  = snap.get("vix") or 20
-        snap["vix_regime"] = "Low" if vix < 15 else ("High" if vix > 30 else "Normal")
-        snap["risk_on"]    = snap.get("risk_on_score", 0.5)
-        _cset(ck, snap)
-        return JSONResponse({**snap, "fromCache": False})
     except Exception as ex:
         raise HTTPException(500, str(ex))
 
@@ -540,9 +536,12 @@ async def macro_snapshot():
 
 @app.get("/timeframes/{symbol}")
 async def timeframes(symbol: str):
-    sym    = symbol.upper().strip()
+    sym    = _canonicalise(symbol)
     result = {}
-    for tf, (period, interval) in {"1d": ("2y","1d"), "1wk": ("5y","1wk")}.items():
+    for tf, (period, interval) in {
+        "1d":  ("2y", "1d"),
+        "1wk": ("5y", "1wk"),
+    }.items():
         try:
             df = StockDataLoader(sym, period=period, interval=interval).load()
             result[tf] = {
@@ -555,6 +554,26 @@ async def timeframes(symbol: str):
     return JSONResponse({"symbol": sym, "timeframes": result})
 
 
+# ── Macro ─────────────────────────────────────────────────────────────────────
+
+@app.get("/macro")
+async def macro_snapshot():
+    ck = "macro:latest"
+    if (cached := _cget(ck)):
+        return JSONResponse({**cached, "fromCache": True})
+    try:
+        snap = MacroLoader().snapshot()
+        vix  = snap.get("vix") or 20
+        snap["vix_regime"] = (
+            "Low" if vix < 15 else ("High" if vix > 30 else "Normal")
+        )
+        snap["risk_on"] = snap.get("risk_on_score", 0.5)
+        _cset(ck, snap)
+        return JSONResponse({**snap, "fromCache": False})
+    except Exception as ex:
+        raise HTTPException(500, str(ex))
+
+
 # ── Portfolio Eval ────────────────────────────────────────────────────────────
 
 @app.post("/portfolio/eval")
@@ -565,10 +584,11 @@ async def portfolio_eval(body: dict):
     results, prices_map = [], {}
 
     for h in holdings:
-        sym    = str(h.get("symbol", "")).upper().strip()
+        sym    = _canonicalise(str(h.get("symbol", "")))
         shares = float(h.get("shares", 0))
         avg_c  = float(h.get("avgCost", 0))
-        if not sym or shares <= 0: continue
+        if not sym or shares <= 0:
+            continue
         try:
             df  = svc.loader.get(sym)
             cur = float(df["close"].iloc[-1])
@@ -585,8 +605,8 @@ async def portfolio_eval(body: dict):
                 "marketValue":  round(mv,    2),
                 "costBasis":    round(cv,    2),
                 "pnl":          round(pnl,   2),
-                "pnlPct":       round((pnl/cv*100 if cv > 0 else 0), 2),
-                "volatility":   round(float(log_r.std())*252**0.5*100, 2),
+                "pnlPct":       round((pnl / cv * 100 if cv > 0 else 0), 2),
+                "volatility":   round(float(log_r.std()) * 252 ** 0.5 * 100, 2),
             })
         except Exception as e:
             results.append({"symbol": sym, "error": str(e)})
@@ -595,29 +615,38 @@ async def portfolio_eval(body: dict):
     total_cost = sum(r.get("costBasis",   0) for r in results)
     total_pnl  = sum(r.get("pnl",         0) for r in results)
     for r in results:
-        r["allocation"] = round(r.get("marketValue", 0)/total_val*100, 2) if total_val > 0 else 0
+        r["allocation"] = (
+            round(r.get("marketValue", 0) / total_val * 100, 2)
+            if total_val > 0 else 0
+        )
 
     port_vol = None
     try:
         if len(prices_map) >= 2:
-            ret_df  = pd.DataFrame({s: p.pct_change() for s, p in prices_map.items()}).dropna()
-            syms_in = [r["symbol"] for r in results if r.get("symbol") in ret_df.columns]
-            weights = [r["allocation"]/100 for r in results if r.get("symbol") in ret_df.columns]
+            ret_df  = pd.DataFrame(
+                {s: p.pct_change() for s, p in prices_map.items()}
+            ).dropna()
+            syms_in = [r["symbol"] for r in results
+                       if r.get("symbol") in ret_df.columns]
+            weights = [r["allocation"] / 100 for r in results
+                       if r.get("symbol") in ret_df.columns]
             if syms_in:
                 w        = np.array(weights)
                 cov      = ret_df[syms_in].cov().values * 252
-                port_vol = round(float((w @ cov @ w)**0.5 * 100), 2)
+                port_vol = round(float((w @ cov @ w) ** 0.5 * 100), 2)
     except Exception:
         pass
 
     return JSONResponse({
-        "holdings":          results,
-        "totalValue":        round(total_val,  2),
-        "totalCost":         round(total_cost, 2),
-        "totalPnl":          round(total_pnl,  2),
-        "totalPnlPct":       round(total_pnl/total_cost*100 if total_cost > 0 else 0, 2),
+        "holdings":            results,
+        "totalValue":          round(total_val,  2),
+        "totalCost":           round(total_cost, 2),
+        "totalPnl":            round(total_pnl,  2),
+        "totalPnlPct":         round(
+            total_pnl / total_cost * 100 if total_cost > 0 else 0, 2
+        ),
         "portfolioVolatility": port_vol,
-        "capital":           capital,
+        "capital":             capital,
     })
 
 

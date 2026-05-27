@@ -1,26 +1,23 @@
 """
-data_loader.py — Stock + Index data pipeline PRODUCTION v4.3
+data_loader.py — Stock + Index data pipeline PRODUCTION v4.4
 ═════════════════════════════════════════════════════════════
-FIXES in v4.3 vs v4.2:
-  ✓ FIXED: ^NSEI, ^BSESN, ^NSEBANK now route correctly through all three
-           sources (Stooq → AlphaVantage → yfinance).
-  ✓ FIXED: URL-encoded symbols like %5ENSEI decoded before processing.
-  ✓ FIXED: yfinance v8 direct API now sends correct Referer + Cookie header
-           to avoid Yahoo's bot-detection 401/403.
-  ✓ ADDED: is_index() helper used to skip AV for unsupported index symbols
-           (saves quota and speeds up fallback).
-  ✓ ADDED: get_live_price() convenience method — used by WebSocket server
-           and the /indices route.
-  ✓ IMPROVED: StockDataLoader.get_info() no longer crashes on index symbols
-              (yfinance .info is empty for indices — graceful fallback).
+ROOT-CAUSE FIX:
+  SENSEX.NS / NIFTY50.NS / BANKNIFTY.NS are invalid symbols.
+  _canonicalise() maps every alias → Yahoo canonical at __init__ time:
+    SENSEX.NS  → ^BSESN
+    NIFTY50.NS → ^NSEI
+    BANKNIFTY.NS → ^NSEBANK
+  Index symbols skip Stooq entirely (Stooq now requires a paid API key
+  for ^BSE and returns an HTML captcha page instead of CSV).
+  Yahoo v8 is the primary source for all ^ index symbols.
 """
 
 import io, logging, os, time
-from datetime import datetime, timedelta
-from pathlib  import Path
+from datetime  import datetime, timedelta
+from pathlib   import Path
 from urllib.parse import unquote
 
-import pandas  as pd
+import pandas   as pd
 import requests
 
 logger = logging.getLogger(__name__)
@@ -33,7 +30,8 @@ _SESSION = requests.Session()
 _SESSION.headers.update({
     "User-Agent":      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/122.0.0.0 Safari/537.36",
     "Accept-Language": "en-US,en;q=0.9",
-    "Accept":          "text/html,application/json,*/*",
+    "Accept":          "application/json, text/html, */*",
+    "Referer":         "https://finance.yahoo.com/",
 })
 
 _PERIOD_DAYS = {
@@ -47,21 +45,69 @@ def _dates(period: str):
     start = end - timedelta(days=days)
     return start.strftime("%Y%m%d"), end.strftime("%Y%m%d")
 
-def _normalise_symbol(sym: str) -> str:
-    """Decode URL-encoding and upper-case. %5ENSEI → ^NSEI."""
-    return unquote(sym).upper().strip()
+
+# ══════════════════════════════════════════════════════════════════════════════
+# CANONICAL SYMBOL MAP  ← THE CORE FIX
+# Every alias variant maps to the Yahoo Finance v8 canonical symbol.
+# _canonicalise() is called at the top of StockDataLoader.__init__ so
+# bad symbols never reach Stooq, AlphaVantage, or Yahoo with the wrong string.
+# ══════════════════════════════════════════════════════════════════════════════
+
+_CANONICAL: dict[str, str] = {
+    # ── Indian indices ────────────────────────────────────────────────────────
+    "^NSEI":         "^NSEI",
+    "NIFTY50":       "^NSEI",
+    "NIFTY50.NS":    "^NSEI",
+    "NIFTY50.BO":    "^NSEI",
+    "NIFTY.NS":      "^NSEI",
+    "NIFTY":         "^NSEI",
+
+    "^BSESN":        "^BSESN",
+    "SENSEX":        "^BSESN",
+    "SENSEX.NS":     "^BSESN",   # ← was crashing
+    "SENSEX.BO":     "^BSESN",
+    "BSE":           "^BSESN",
+    "BSE.NS":        "^BSESN",
+
+    "^NSEBANK":      "^NSEBANK",
+    "BANKNIFTY":     "^NSEBANK",
+    "BANKNIFTY.NS":  "^NSEBANK",
+    "BANKNIFTY.BO":  "^NSEBANK",
+    "NSEBANK":       "^NSEBANK",
+    "NSEBANK.NS":    "^NSEBANK",
+
+    # ── Global indices ────────────────────────────────────────────────────────
+    "^GSPC":    "^GSPC",   "SP500":    "^GSPC",
+    "^DJI":     "^DJI",    "DOW":      "^DJI",
+    "^IXIC":    "^IXIC",   "NASDAQ":   "^IXIC",
+    "^VIX":     "^VIX",
+    "^TNX":     "^TNX",
+    "^FTSE":    "^FTSE",
+    "^GDAXI":   "^GDAXI",  "DAX":      "^GDAXI",
+    "^FCHI":    "^FCHI",   "CAC40":    "^FCHI",
+    "^N225":    "^N225",   "NIKKEI":   "^N225",
+    "^HSI":     "^HSI",    "HANGSENG": "^HSI",
+    "^AXJO":    "^AXJO",
+    "^KS11":    "^KS11",
+}
+
+
+def _canonicalise(symbol: str) -> str:
+    """
+    Decode URL-encoding (%5ENSEI → ^NSEI), upper-case, then map any
+    known alias to the Yahoo-canonical symbol. Returns unchanged if unknown.
+    """
+    s = unquote(symbol).upper().strip()
+    return _CANONICAL.get(s, s)
+
 
 def is_index(sym: str) -> bool:
-    """True for market indices (^NSEI, ^BSESN, ^GSPC, etc.)."""
-    s = _normalise_symbol(sym)
-    return s.startswith("^") or s in (
-        "NIFTY50", "SENSEX", "BANKNIFTY",
-        "NIFTY50.NS", "SENSEX.BO", "BANKNIFTY.NS",
-    )
+    """True for any market index (^ prefix after canonicalisation)."""
+    return _canonicalise(sym).startswith("^")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# STOOQ SYMBOL TRANSLATION
+# STOOQ SYMBOL TRANSLATION  (equities only — never called for indices)
 # ══════════════════════════════════════════════════════════════════════════════
 
 _YF_TO_STOOQ: list[tuple[str, str]] = sorted([
@@ -71,7 +117,7 @@ _YF_TO_STOOQ: list[tuple[str, str]] = sorted([
     (".T",  ".JP"),
     (".HK", ".HK"),
     (".AX", ".AU"), (".NZ", ".NZ"), (".SG", ".SG"),
-    (".TW", ".TW"), (".TWO",".TW"),
+    (".TW", ".TW"), (".TWO", ".TW"),
     (".KS", ".KR"), (".KQ", ".KR"),
     (".SS", ".CN"), (".SZ", ".CN"),
     (".KL", ".MY"), (".BK", ".TH"), (".JK", ".JK"),
@@ -83,35 +129,18 @@ _YF_TO_STOOQ: list[tuple[str, str]] = sorted([
     (".ME", ".RU"), (".SA", ".BR"), (".JO", ".SJ"),
 ], key=lambda x: -len(x[0]))
 
-_INDEX_ALIAS_PREFIX: list[tuple[str, str]] = sorted([
-    ("NIFTY50",  "^NII50"),
-    ("NIFTY500", "^NII500"),
-    ("NIFTY",    "^NII50"),
-    ("SENSEX",   "^BSE"),
-    ("BANKNIFTY","^NSEBANK"),
-], key=lambda x: -len(x[0]))
 
 def _stooq_sym(symbol: str) -> str:
-    s = _normalise_symbol(symbol)
-
-    # 0. Index alias prefix normalisation
-    for alias, canonical in _INDEX_ALIAS_PREFIX:
-        if s == alias or s.startswith(alias + ".") or s.startswith(alias + "-"):
-            return canonical
-
-    # 1. Exact map
+    s = symbol.upper().strip()
     _exact = {
-        "^GSPC":    "^SPX",  "^DJI":  "^DJI",  "^IXIC": "^NDQ",
-        "^VIX":     "^VIX",  "^TNX":  "^TNX",
-        "^NSEI":    "^NII50","^BSESN":"^BSE",   "^NSEBANK": "^NSEBANK",
-        "^FTSE":    "^FTM",  "^GDAXI":"^DAX",   "^FCHI":  "^CAC",
-        "^N225":    "^NKX",  "^HSI":  "^HSI",
-        "^AXJO":    "^AXJO", "^KS11": "^KS11",
-        "CL=F":"CL.F","GC=F":"GC.F","SI=F":"SI.F","NG=F":"NG.F",
+        "^GSPC": "^SPX", "^DJI": "^DJI", "^IXIC": "^NDQ",
+        "^VIX":  "^VIX", "^TNX": "^TNX",
+        "^FTSE": "^FTM", "^GDAXI": "^DAX", "^FCHI": "^CAC",
+        "^N225": "^NKX", "^HSI": "^HSI",   "^AXJO": "^AXJO",
+        "CL=F":  "CL.F", "GC=F": "GC.F",   "SI=F": "SI.F", "NG=F": "NG.F",
     }
     if s in _exact:
         return _exact[s]
-
     if s.startswith("^"):
         return s
     if s.endswith("=X"):
@@ -136,22 +165,20 @@ def _stooq_sym(symbol: str) -> str:
 # ══════════════════════════════════════════════════════════════════════════════
 
 _YF_TO_AV: list[tuple[str, str]] = sorted([
-    (".NS",".BSE"), (".BO",".BSE"), (".L",".LON"), (".TO",".TRT"),
-    (".T",".TSE"),  (".HK",".HKEX"),(".AX",".ASX"),(".SG",".SGX"),
-    (".TW",".TSEC"),(".TWO",".TSEC"),(".KS",".KSC"),(".SS",".SHH"),
-    (".SZ",".SHZ"), (".DE",".DEX"), (".PA",".PAR"),(".SW",".SWX"),
-    (".AS",".AMS"), (".MI",".MIL"), (".MC",".BME"),(".OL",".OSL"),
-    (".ST",".STO"), (".ME",".MCX"), (".SA",".SAO"),(".JO",".JSE"),
+    (".NS", ".BSE"), (".BO", ".BSE"), (".L", ".LON"),  (".TO", ".TRT"),
+    (".T",  ".TSE"), (".HK", ".HKEX"),(".AX", ".ASX"), (".SG", ".SGX"),
+    (".TW", ".TSEC"),(".TWO",".TSEC"),(".KS", ".KSC"), (".SS", ".SHH"),
+    (".SZ", ".SHZ"), (".DE", ".DEX"), (".PA", ".PAR"), (".SW", ".SWX"),
+    (".AS", ".AMS"), (".MI", ".MIL"), (".MC", ".BME"), (".OL", ".OSL"),
+    (".ST", ".STO"), (".ME", ".MCX"), (".SA", ".SAO"), (".JO", ".JSE"),
 ], key=lambda x: -len(x[0]))
 
+
 def _av_sym(symbol: str) -> str:
-    s = _normalise_symbol(symbol)
-    # Indices not supported by AV
+    s = symbol.upper().strip()
+    # All index symbols are unsupported by AlphaVantage
     if is_index(s):
         return "__INDEX_NOT_SUPPORTED__"
-    for alias, _ in _INDEX_ALIAS_PREFIX:
-        if s == alias or s.startswith(alias + ".") or s.startswith(alias + "-"):
-            return "__INDEX_NOT_SUPPORTED__"
     if s.endswith("=X"):
         pair = s[:-2]
         return (pair[:3] + "/" + pair[3:]) if len(pair) == 6 else pair
@@ -174,15 +201,18 @@ def _av_sym(symbol: str) -> str:
 
 class StockDataLoader:
     def __init__(self, symbol: str, period: str = "2y", interval: str = "1d"):
-        self.symbol   = _normalise_symbol(symbol)
+        # _canonicalise MUST be first — converts SENSEX.NS → ^BSESN etc.
+        self.symbol   = _canonicalise(symbol)
         self.period   = period
         self.interval = interval
+        if self.symbol != symbol.upper().strip():
+            logger.info("[DataLoader] '%s' → canonical '%s'", symbol, self.symbol)
         safe = (self.symbol
                 .replace("/", "_").replace("^", "IDX_")
                 .replace("=", "_").replace("-", "_"))
         self.cache_path = DATA_DIR / f"{safe}_{interval}.csv"
 
-    # ── Public ────────────────────────────────────────────────────────────────
+    # ── Public API ────────────────────────────────────────────────────────────
 
     def load(self, force_refresh: bool = False) -> pd.DataFrame:
         if not force_refresh and self._cache_fresh():
@@ -199,34 +229,34 @@ class StockDataLoader:
         return df
 
     def get_info(self) -> dict:
-        """Return metadata. Safe for index symbols — falls back gracefully."""
-        base = {"symbol": self.symbol, "name": self.symbol, "currency": "INR" if self._is_indian() else "USD"}
-
-        # For indices, try Yahoo meta endpoint (no full .info call)
+        base = {
+            "symbol":   self.symbol,
+            "name":     self.symbol,
+            "currency": "INR" if self._is_indian() else "USD",
+        }
         if is_index(self.symbol):
             try:
-                url = f"https://query1.finance.yahoo.com/v8/finance/chart/{self.symbol}"
-                r   = _SESSION.get(url, timeout=5,
-                                   headers={"Referer": "https://finance.yahoo.com/"})
-                meta = r.json().get("chart", {}).get("result", [{}])[0].get("meta", {})
+                url  = (f"https://query1.finance.yahoo.com/v8/finance/chart/"
+                        f"{self.symbol}?range=5d&interval=1d")
+                r    = _SESSION.get(url, timeout=5)
+                meta = r.json()["chart"]["result"][0]["meta"]
                 return {
                     **base,
-                    "name":     meta.get("shortName", self.symbol),
-                    "currency": meta.get("currency", "INR"),
+                    "name":     meta.get("shortName",    self.symbol),
+                    "currency": meta.get("currency",     "INR"),
                     "exchange": meta.get("exchangeName", "NSE"),
                 }
             except Exception:
                 return base
-
         try:
             import yfinance as yf
             info = yf.Ticker(self.symbol, session=_SESSION).info or {}
             return {
                 "symbol":     self.symbol,
-                "name":       info.get("longName",        self.symbol),
-                "sector":     info.get("sector",          "N/A"),
-                "currency":   info.get("currency",        "USD"),
-                "exchange":   info.get("exchange",        "N/A"),
+                "name":       info.get("longName",          self.symbol),
+                "sector":     info.get("sector",            "N/A"),
+                "currency":   info.get("currency",          "USD"),
+                "exchange":   info.get("exchange",          "N/A"),
                 "market_cap": info.get("marketCap"),
                 "pe_ratio":   info.get("trailingPE"),
                 "52w_high":   info.get("fiftyTwoWeekHigh"),
@@ -246,34 +276,90 @@ class StockDataLoader:
             return []
 
     def get_live_price(self) -> dict:
-        """Fast single-price lookup — used by WebSocket / indices API."""
-        try:
-            url = (f"https://query1.finance.yahoo.com/v8/finance/chart/"
-                   f"{self.symbol}?interval=1d&range=5d")
-            r   = _SESSION.get(url, timeout=6,
-                               headers={"Referer": "https://finance.yahoo.com/"})
-            meta = r.json()["chart"]["result"][0]["meta"]
-            price     = meta["regularMarketPrice"]
-            prevClose = meta.get("previousClose") or meta.get("chartPreviousClose") or price
-            change    = round(price - prevClose, 2)
-            changePct = round((change / prevClose) * 100, 2) if prevClose else 0
-            return {
-                "symbol":        self.symbol,
-                "price":         round(price,     2),
-                "change":        change,
-                "changePercent": changePct,
-                "open":          meta.get("regularMarketOpen"),
-                "currency":      meta.get("currency", "INR" if self._is_indian() else "USD"),
-            }
-        except Exception as e:
-            raise RuntimeError(f"[{self.symbol}] live price failed: {e}") from e
+        """Fast single-price lookup used by WebSocket / indices API."""
+        url = (f"https://query1.finance.yahoo.com/v8/finance/chart/"
+               f"{self.symbol}?range=5d&interval=1d")
+        r = _SESSION.get(url, timeout=6)
+        r.raise_for_status()
+        data   = r.json()
+        result = data.get("chart", {}).get("result")
+        if not result:
+            raise RuntimeError(f"[{self.symbol}] live price: no result from Yahoo")
+        meta      = result[0]["meta"]
+        price     = meta["regularMarketPrice"]
+        prevClose = (meta.get("previousClose")
+                     or meta.get("chartPreviousClose")
+                     or price)
+        change    = round(price - prevClose, 2)
+        changePct = round((change / prevClose) * 100, 2) if prevClose else 0
+        return {
+            "symbol":        self.symbol,
+            "price":         round(price, 2),
+            "change":        change,
+            "changePercent": changePct,
+            "open":          meta.get("regularMarketOpen"),
+            "currency":      meta.get("currency",
+                                      "INR" if self._is_indian() else "USD"),
+        }
 
     # ── Download orchestration ────────────────────────────────────────────────
 
     def _download(self) -> pd.DataFrame:
         errors = []
 
-        # 1. Stooq
+        # ── INDEX FAST PATH ───────────────────────────────────────────────────
+        # Stooq now requires a paid API key for ^BSE — skip it entirely.
+        # Yahoo v8 handles all ^ symbols natively and reliably.
+        if is_index(self.symbol):
+            try:
+                df = self._from_yfinance()
+                if not df.empty:
+                    logger.info("[%s] yfinance OK (index fast-path)", self.symbol)
+                    return df
+            except Exception as e:
+                errors.append(f"yfinance: {e}")
+
+            # NSE India as secondary fallback (NIFTY 50 + BANK NIFTY only)
+            try:
+                _NSE_MAP = {"^NSEI": "NIFTY 50", "^NSEBANK": "NIFTY BANK"}
+                name = _NSE_MAP.get(self.symbol)
+                if not name:
+                    raise ValueError(f"NSE India: no mapping for {self.symbol}")
+                from stock_nse_india import NseIndia  # type: ignore
+                nse  = NseIndia()
+                data = nse.getEquityIndices(name)
+                if not data or not data.get("last"):
+                    raise ValueError(f"NSE India: empty data for {name}")
+                price = float(data["last"])
+                df = pd.DataFrame([{
+                    "open":   float(data.get("open",  price)),
+                    "high":   float(data.get("high",  price)),
+                    "low":    float(data.get("low",   price)),
+                    "close":  price,
+                    "volume": float(data.get("totalTradedVolume", 0) or 0),
+                }], index=[pd.Timestamp.today().normalize()])
+                df = self._clean(df)
+                if not df.empty:
+                    logger.info("[%s] NSE India OK", self.symbol)
+                    return df
+            except Exception as e:
+                errors.append(f"NSE India: {e}")
+
+            # Stale cache as last resort
+            if self.cache_path.exists():
+                try:
+                    df = self._read_cache()
+                    if not df.empty:
+                        logger.warning("[%s] using stale cache (index)", self.symbol)
+                        return df
+                except Exception:
+                    pass
+
+            raise RuntimeError(
+                f"[{self.symbol}] index data failed: {'; '.join(errors)}"
+            )
+
+        # ── EQUITY PATH: Stooq → AlphaVantage → Yahoo ─────────────────────────
         try:
             df = self._from_stooq()
             if not df.empty:
@@ -282,9 +368,8 @@ class StockDataLoader:
         except Exception as e:
             errors.append(f"Stooq: {e}")
 
-        # 2. AlphaVantage (skip for indices — they're not supported)
         key = os.getenv("ALPHA_VANTAGE_KEY", "").strip()
-        if key and not is_index(self.symbol):
+        if key:
             try:
                 df = self._from_alphavantage(key)
                 if not df.empty:
@@ -292,10 +377,7 @@ class StockDataLoader:
                     return df
             except Exception as e:
                 errors.append(f"AV: {e}")
-        elif is_index(self.symbol):
-            errors.append("AV: skipped for index symbols")
 
-        # 3. yfinance Yahoo v8
         try:
             df = self._from_yfinance()
             if not df.empty:
@@ -304,7 +386,6 @@ class StockDataLoader:
         except Exception as e:
             errors.append(f"yfinance: {e}")
 
-        # 4. Stale cache
         if self.cache_path.exists():
             try:
                 df = self._read_cache()
@@ -314,7 +395,50 @@ class StockDataLoader:
             except Exception:
                 pass
 
-        raise RuntimeError(f"[{self.symbol}] all sources failed: {'; '.join(errors)}")
+        raise RuntimeError(
+            f"[{self.symbol}] all sources failed: {'; '.join(errors)}"
+        )
+
+    # ── Source: Yahoo Finance v8 direct ───────────────────────────────────────
+
+    def _from_yfinance(self) -> pd.DataFrame:
+        days  = _PERIOD_DAYS.get(self.period, 730)
+        end   = int(datetime.today().timestamp())
+        start = int((datetime.today() - timedelta(days=days)).timestamp())
+        iv    = {"1d": "1d", "1wk": "1wk", "1mo": "1mo"}.get(self.interval, "1d")
+
+        url = (f"https://query1.finance.yahoo.com/v8/finance/chart/{self.symbol}"
+               f"?period1={start}&period2={end}&interval={iv}&events=history")
+        resp = _SESSION.get(url, timeout=12)
+        resp.raise_for_status()
+        data   = resp.json()
+        result = data.get("chart", {}).get("result")
+        if not result:
+            err = data.get("chart", {}).get("error", {})
+            raise ValueError(f"Yahoo v8: {err}")
+
+        r          = result[0]
+        timestamps = r.get("timestamp", [])
+        q          = r.get("indicators", {}).get("quote",    [{}])[0]
+        adj        = r.get("indicators", {}).get("adjclose", [{}])
+        adjclose   = adj[0].get("adjclose", []) if adj else []
+
+        if not timestamps:
+            raise ValueError("Yahoo v8: empty timestamp list")
+
+        close_vals = (adjclose if len(adjclose) == len(timestamps)
+                      else q.get("close", [None] * len(timestamps)))
+
+        df = pd.DataFrame({
+            "date":   pd.to_datetime(timestamps, unit="s"),
+            "open":   q.get("open",   [None] * len(timestamps)),
+            "high":   q.get("high",   [None] * len(timestamps)),
+            "low":    q.get("low",    [None] * len(timestamps)),
+            "close":  close_vals,
+            "volume": q.get("volume", [None] * len(timestamps)),
+        })
+        df["date"] = df["date"].dt.tz_localize(None)
+        return self._clean(df.set_index("date").sort_index())
 
     # ── Source: Stooq ─────────────────────────────────────────────────────────
 
@@ -325,13 +449,18 @@ class StockDataLoader:
         r      = _SESSION.get(url, timeout=10)
         r.raise_for_status()
         text = r.text.strip()
-        if len(text) < 50 or "No data" in text or "Exceeded" in text:
-            raise ValueError(f"Stooq: empty/blocked response for '{sym}'")
+        if (len(text) < 50
+                or "No data" in text
+                or "Exceeded" in text
+                or "apikey" in text.lower()
+                or "captcha" in text.lower()):
+            raise ValueError(f"Stooq: empty/blocked/rate-limited for '{sym}'")
         try:
             df = pd.read_csv(io.StringIO(text))
         except Exception as e:
             raise ValueError(
-                f"Stooq: CSV parse error for '{sym}' (raw={text[:120]!r}): {e}"
+                f"Stooq: CSV parse error for '{sym}' "
+                f"(raw={text[:120]!r}): {e}"
             ) from e
         df.columns = [c.strip().lower() for c in df.columns]
         df["date"] = pd.to_datetime(df["date"])
@@ -347,7 +476,8 @@ class StockDataLoader:
 
         if s.endswith("=X"):
             parts    = av_symbol.split("/")
-            from_cur, to_cur = (parts[0], parts[1]) if len(parts) == 2 else (av_symbol[:3], av_symbol[3:])
+            from_cur = parts[0] if len(parts) == 2 else av_symbol[:3]
+            to_cur   = parts[1] if len(parts) == 2 else av_symbol[3:]
             url = (f"https://www.alphavantage.co/query"
                    f"?function=FX_DAILY&from_symbol={from_cur}&to_symbol={to_cur}"
                    f"&outputsize=full&apikey={key}&datatype=csv")
@@ -369,79 +499,43 @@ class StockDataLoader:
             import json
             try:
                 msg  = json.loads(text)
-                note = msg.get("Note") or msg.get("Information") or msg.get("Error Message") or text[:200]
+                note = (msg.get("Note") or msg.get("Information")
+                        or msg.get("Error Message") or text[:200])
             except Exception:
                 note = text[:200]
             raise ValueError(f"AV: {note}")
 
         df = pd.read_csv(io.StringIO(text))
         df.columns = [c.lower().strip() for c in df.columns]
-        date_col = next((c for c in df.columns if "time" in c or "date" in c), None)
+        date_col = next(
+            (c for c in df.columns if "time" in c or "date" in c), None
+        )
         if not date_col:
             raise ValueError(f"AV: no date column. Got: {list(df.columns)}")
         df = df.rename(columns={date_col: "date"})
         if "adjusted_close" in df.columns:
             df = df.rename(columns={"adjusted_close": "close"})
-        close_col = next((c for c in df.columns if c == "close" or c.startswith("close")), None)
+        close_col = next(
+            (c for c in df.columns if c == "close" or c.startswith("close")), None
+        )
         if close_col and close_col != "close":
             df = df.rename(columns={close_col: "close"})
         df["date"] = pd.to_datetime(df["date"], errors="coerce")
         df = df.dropna(subset=["date"]).set_index("date").sort_index()
-        cutoff = (datetime.today() - timedelta(days=_PERIOD_DAYS.get(self.period, 730))).strftime("%Y-%m-%d")
+        cutoff = (datetime.today() - timedelta(
+            days=_PERIOD_DAYS.get(self.period, 730)
+        )).strftime("%Y-%m-%d")
         df = df[df.index >= cutoff]
-        cols = [c for c in ["open", "high", "low", "close", "volume"] if c in df.columns]
+        cols = [c for c in ["open", "high", "low", "close", "volume"]
+                if c in df.columns]
         return self._clean(df[cols])
 
-    # ── Source: yfinance / Yahoo Finance v8 direct ────────────────────────────
-
-    def _from_yfinance(self) -> pd.DataFrame:
-        days  = _PERIOD_DAYS.get(self.period, 730)
-        end   = int(datetime.today().timestamp())
-        start = int((datetime.today() - timedelta(days=days)).timestamp())
-        iv    = {"1d": "1d", "1wk": "1wk", "1mo": "1mo"}.get(self.interval, "1d")
-
-        url = (f"https://query1.finance.yahoo.com/v8/finance/chart/{self.symbol}"
-               f"?period1={start}&period2={end}&interval={iv}&events=history")
-        headers = {
-            "User-Agent":      ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                                "AppleWebKit/537.36 Chrome/122.0.0.0 Safari/537.36"),
-            "Accept":          "application/json",
-            "Accept-Language": "en-US,en;q=0.9",
-            "Referer":         "https://finance.yahoo.com/",
-        }
-        resp = _SESSION.get(url, headers=headers, timeout=12)
-        resp.raise_for_status()
-        data   = resp.json()
-        result = data.get("chart", {}).get("result")
-        if not result:
-            err = data.get("chart", {}).get("error", {})
-            raise ValueError(f"Yahoo v8: {err}")
-
-        r          = result[0]
-        timestamps = r.get("timestamp", [])
-        q          = r.get("indicators", {}).get("quote",    [{}])[0]
-        adj        = r.get("indicators", {}).get("adjclose", [{}])
-        adjclose   = adj[0].get("adjclose", []) if adj else []
-        if not timestamps:
-            raise ValueError("Yahoo v8: empty timestamp list")
-        close_vals = (adjclose if len(adjclose) == len(timestamps)
-                      else q.get("close", [None] * len(timestamps)))
-        df = pd.DataFrame({
-            "date":   pd.to_datetime(timestamps, unit="s"),
-            "open":   q.get("open",   [None] * len(timestamps)),
-            "high":   q.get("high",   [None] * len(timestamps)),
-            "low":    q.get("low",    [None] * len(timestamps)),
-            "close":  close_vals,
-            "volume": q.get("volume", [None] * len(timestamps)),
-        })
-        df["date"] = df["date"].dt.tz_localize(None)
-        return self._clean(df.set_index("date").sort_index())
-
-    # ── Helpers ───────────────────────────────────────────────────────────────
+    # ── Cache helpers ─────────────────────────────────────────────────────────
 
     def _is_indian(self) -> bool:
-        return any(self.symbol.endswith(x) for x in (".NS", ".BO", ".NSE", ".BSE")) or \
-               self.symbol.startswith("^NSEI") or self.symbol in ("^BSESN", "^NSEBANK")
+        s = self.symbol
+        return (any(s.endswith(x) for x in (".NS", ".BO", ".NSE", ".BSE"))
+                or s in ("^NSEI", "^BSESN", "^NSEBANK"))
 
     def _read_cache(self) -> pd.DataFrame:
         df = pd.read_csv(self.cache_path, index_col=0, parse_dates=True)
@@ -456,7 +550,9 @@ class StockDataLoader:
     def _cache_fresh(self) -> bool:
         if not self.cache_path.exists():
             return False
-        age_hours = (datetime.now().timestamp() - self.cache_path.stat().st_mtime) / 3600
+        age_hours = (
+            (datetime.now().timestamp() - self.cache_path.stat().st_mtime) / 3600
+        )
         return age_hours < CACHE_TTL_HOURS
 
     @staticmethod
@@ -465,7 +561,8 @@ class StockDataLoader:
             return pd.DataFrame()
         df = df.copy()
         df.columns = [c.lower() for c in df.columns]
-        cols = [c for c in ["open", "high", "low", "close", "volume"] if c in df.columns]
+        cols = [c for c in ["open", "high", "low", "close", "volume"]
+                if c in df.columns]
         if "close" not in cols:
             return pd.DataFrame()
         df = df[cols]
@@ -482,7 +579,7 @@ class StockDataLoader:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# DATA LOADER SERVICE
+# DATA LOADER SERVICE SINGLETON
 # ══════════════════════════════════════════════════════════════════════════════
 
 class DataLoader:
@@ -490,7 +587,7 @@ class DataLoader:
         self._cache: dict = {}
 
     def _loader(self, symbol: str, interval: str = "1d") -> StockDataLoader:
-        sym = _normalise_symbol(symbol)
+        sym = _canonicalise(symbol)          # normalise before cache key
         key = f"{sym}_{interval}"
         if key not in self._cache:
             self._cache[key] = StockDataLoader(sym, interval=interval)
@@ -507,7 +604,6 @@ class DataLoader:
         return self._loader(symbol).get_headlines(n)
 
     def get_live_price(self, symbol: str) -> dict:
-        """Used by the /indices endpoint and WebSocket server."""
         return self._loader(symbol).get_live_price()
 
     def get_macro(self) -> pd.DataFrame:
@@ -531,8 +627,12 @@ def load_stock(symbol: str, period: str = "2y") -> pd.DataFrame:
 
 class MacroLoader:
     _SYMBOLS = {
-        "vix":   "^VIX",  "sp500": "^GSPC", "dxy": "DX-Y.NYB",
-        "oil":   "CL=F",  "gold":  "GC=F",  "tnx": "^TNX",
+        "vix":   "^VIX",
+        "sp500": "^GSPC",
+        "dxy":   "DX-Y.NYB",
+        "oil":   "CL=F",
+        "gold":  "GC=F",
+        "tnx":   "^TNX",
     }
     _CACHE = DATA_DIR / "_macro.csv"
     _TTL   = 6 * 3600
@@ -566,11 +666,15 @@ class MacroLoader:
         except Exception:
             snap = {k: None for k in self._SYMBOLS}
         vix = snap.get("vix") or 20.0
-        snap["risk_on_score"] = round(max(0.0, min(1.0, 1.0 - (vix - 15) / 25)), 2)
+        snap["risk_on_score"] = round(
+            max(0.0, min(1.0, 1.0 - (vix - 15) / 25)), 2
+        )
         try:
             df  = self.get()
             sp  = df["sp500"].dropna()
-            snap["sp500_trend"] = "up" if sp.iloc[-1] > sp.rolling(20).mean().iloc[-1] else "down"
+            snap["sp500_trend"] = (
+                "up" if sp.iloc[-1] > sp.rolling(20).mean().iloc[-1] else "down"
+            )
         except Exception:
             snap["sp500_trend"] = "unknown"
         return snap
@@ -579,7 +683,8 @@ class MacroLoader:
         frames: dict = {}
         for name, sym in self._SYMBOLS.items():
             try:
-                df = StockDataLoader(sym, period=period)._from_stooq()
+                # Use yfinance directly for all macro symbols (indices + futures)
+                df = StockDataLoader(sym, period=period)._from_yfinance()
                 if not df.empty:
                     frames[name] = df["close"].rename(name)
             except Exception as e:
