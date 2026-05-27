@@ -1,7 +1,4 @@
-"""
-sitecustomize.py — Ensures ai-engine dir is always on sys.path.
-Python imports this automatically at startup, including uvicorn subprocesses.
-"""
+
 import sys
 from pathlib import Path
 

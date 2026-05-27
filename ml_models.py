@@ -1,12 +1,4 @@
-"""
-ml_models.py — Tabular ML Models v5.0
-══════════════════════════════════════
-Bulletproof design:
-  • Every fit/predict wrapped in try/except
-  • predict() always returns array of correct length
-  • XGBoost/LightGBM cloned properly for OOF training
-  • No shared mutable state between clones
-"""
+
 
 import logging
 import numpy as np

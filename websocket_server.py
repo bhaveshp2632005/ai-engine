@@ -1,19 +1,4 @@
-"""
-websocket_server.py — Real-time price + regime streaming over WebSocket.
 
-Register in main.py:
-    from websocket_server import ws_endpoint
-    @app.websocket("/ws")
-    async def websocket_route(ws: WebSocket):
-        await ws_endpoint(ws, svc.regime)
-
-Client protocol:
-    Send: { "action": "subscribe",   "symbol": "TSLA" }
-          { "action": "unsubscribe", "symbol": "TSLA" }
-          { "action": "ping" }
-    Recv: { "type": "price_update", "symbol": ..., "price": ...,
-            "change": ..., "changePct": ..., "regime": ..., "ts": ... }
-"""
 import asyncio, json, logging, time
 from datetime import datetime, timezone
 from typing   import Dict, Set

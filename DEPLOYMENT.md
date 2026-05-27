@@ -1,59 +1,8 @@
-# 🚀 AI Trading Engine — Deployment Guide
 
-## Files to DELETE from your project
-
-These files are **not needed** in production and will slow down / break the deployment:
-
-```
-lstm_model.py          ← torch/LSTM (2GB RAM — kills free tier)
-rl_trading_agent.py    ← stable-baselines3 (RL agent removed)
-api_server.py          ← old duplicate server file
-```
 
 ---
 
-## Files REPLACED (use new versions from this package)
 
-| File | What changed |
-|------|-------------|
-| `main.py` | Removed RL endpoints, uses `LightEnsemble`, fixed PORT env var |
-| `ensemble_model.py` | Replaced `HybridEnsemble` with `LightEnsemble` (no LSTM/GRU) |
-| `sentiment_analysis.py` | FinBERT removed, lexicon-only (instant, 0 RAM) |
-| `regime_detection.py` | hmmlearn removed, KMeans only |
-| `data_loader.py` | Fixed `interval` kwarg, timeouts 20s→10s |
-| `requirements.txt` | Removed torch/transformers/stable-baselines3/hmmlearn |
-
-## Files UNCHANGED (copy as-is from your project)
-
-```
-feature_engineering.py   ← no changes needed
-portfolio_optimizer.py   ← no changes needed
-risk_manager.py          ← no changes needed
-ml_models.py             ← no changes needed
-backtesting_engine.py    ← no changes needed
-visualization.py         ← no changes needed
-websocket_server.py      ← no changes needed
-```
-
----
-
-## Render.com Deployment (Free Tier)
-
-### Step 1 — Push to GitHub
-```bash
-git init
-git add .
-git commit -m "production build"
-git remote add origin https://github.com/YOUR_USERNAME/YOUR_REPO.git
-git push -u origin main
-```
-
-### Step 2 — Create Render Web Service
-1. Go to https://render.com → **New** → **Web Service**
-2. Connect your GitHub repo
-3. Render auto-detects `render.yaml` — click **Deploy**
-
-### Step 3 — Set Environment Variables (Render Dashboard)
 ```
 PORT           = 10000        (Render sets this automatically)
 ENV            = production
@@ -76,19 +25,7 @@ curl https://your-app.onrender.com/health
 
 ---
 
-## Railway Deployment
 
-```bash
-# Install Railway CLI
-npm install -g @railway/cli
-
-# Login and deploy
-railway login
-railway init
-railway up
-```
-
-Set environment variables in Railway dashboard (same as above).
 
 ---
 

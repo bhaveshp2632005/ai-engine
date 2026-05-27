@@ -1,12 +1,4 @@
-"""
-regime_detection.py — Market Regime Detection v5.0 PRODUCTION
-═══════════════════════════════════════════════════════════════
-CHANGES vs dev version:
-  ✗ REMOVED: hmmlearn HMM (optional dep removed for free tier)
-  ✓ KEPT:    KMeans regime detection (always works, no optional deps)
-  ✓ KEPT:    All public API (RegimeResult, RegimeDetector)
-  ✓ KEPT:    Volatility labels, trend strength, model weights
-"""
+
 
 import logging
 import warnings

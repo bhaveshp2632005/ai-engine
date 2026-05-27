@@ -1,12 +1,4 @@
-"""
-portfolio_optimizer.py — Modern Portfolio Theory + ML-enhanced optimization.
 
-FIXES vs original:
-  • Constructor accepts symbols OR infers from price_data keys
-  • optimize() signature unified: optimize(price_data, method, ml_returns)
-  • efficient_frontier() robust (returns [] on failure, never throws)
-  • All scipy minimize calls wrapped in try/except → equal-weight fallback
-"""
 import logging
 from dataclasses import dataclass, field
 from typing      import Dict, List, Optional

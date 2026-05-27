@@ -1,16 +1,4 @@
-"""
-data_loader.py — Stock + Index data pipeline PRODUCTION v4.4
-═════════════════════════════════════════════════════════════
-ROOT-CAUSE FIX:
-  SENSEX.NS / NIFTY50.NS / BANKNIFTY.NS are invalid symbols.
-  _canonicalise() maps every alias → Yahoo canonical at __init__ time:
-    SENSEX.NS  → ^BSESN
-    NIFTY50.NS → ^NSEI
-    BANKNIFTY.NS → ^NSEBANK
-  Index symbols skip Stooq entirely (Stooq now requires a paid API key
-  for ^BSE and returns an HTML captcha page instead of CSV).
-  Yahoo v8 is the primary source for all ^ index symbols.
-"""
+
 
 import io, logging, os, time
 from datetime  import datetime, timedelta

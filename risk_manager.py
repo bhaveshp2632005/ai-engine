@@ -1,13 +1,4 @@
-"""
-risk_manager.py — Institutional Risk Management Engine.
-Computes: position size · stop-loss · risk score · VaR · Expected Shortfall
 
-FIXES vs original:
-  • assess() accepts both market_regime= and regime= kwargs
-  • confidence param: accepts 0-1 OR 0-100 (auto-normalised)
-  • ATR calc guards against NaN/0 ATR
-  • Soft-failure on VaR calculation
-"""
 import logging
 from dataclasses import dataclass
 from typing      import Dict, Optional

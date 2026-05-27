@@ -1,14 +1,4 @@
-"""
-sentiment_analysis.py — Lexicon-only Sentiment (PRODUCTION)
-════════════════════════════════════════════════════════════
-CHANGES vs dev version:
-  ✗ REMOVED: FinBERT / transformers (500MB download, 2GB RAM)
-  ✗ REMOVED: _load_finbert(), _finbert_score()
-  ✓ KEPT:    Financial lexicon scoring (instant, 0 RAM overhead)
-  ✓ KEPT:    Yahoo RSS, GNews, Finnhub news fetchers
-  ✓ KEPT:    All public API (SentimentResult, SentimentAnalyzer)
-  ✓ ADDED:   _load_finbert() stub (for import compat in main.py lifespan)
-"""
+
 
 import logging
 import os

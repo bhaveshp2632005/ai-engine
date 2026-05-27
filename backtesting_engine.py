@@ -1,15 +1,4 @@
-"""
-backtesting_engine.py — Professional Pure-Python Backtesting Engine v3.0
-═════════════════════════════════════════════════════════════════════════
-Root-cause fix for: Total Trades=0, Return=0%, Sharpe=0
 
-Strategy:
-  BUY  when composite score ≥ threshold AND RSI < 70 AND price > MA50
-  SELL when RSI > 75 OR score ≤ −threshold OR stop-loss hit OR take-profit hit
-
-Outputs: equity_curve · drawdown_curve · trade_list · all metrics
-No backtrader dependency — pure numpy + pandas.
-"""
 from __future__ import annotations
 import logging
 from dataclasses import dataclass, field

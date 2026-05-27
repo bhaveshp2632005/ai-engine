@@ -1,7 +1,4 @@
-"""
-feature_engineering.py — Institutional-grade feature engineering.
-Momentum · Volatility · Volume · Statistical · Multi-timeframe · Macro overlay
-"""
+
 import logging
 import numpy  as np
 import pandas as pd

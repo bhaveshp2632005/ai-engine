@@ -1,7 +1,4 @@
-"""
-visualization.py — Professional dark-theme charts for AI prediction engine.
-Charts: price, indicators, prediction, signals, portfolio, full_dashboard.
-"""
+
 
 import io, logging
 from pathlib  import Path

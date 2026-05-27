@@ -1,15 +1,3 @@
-"""
-main.py — AI Engine v4.4 PRODUCTION
-════════════════════════════════════
-FIXES vs v4.0:
-  FIX 1 (500 index): _canonicalise() called at the top of every endpoint
-         that takes a symbol. SENSEX.NS / NIFTY50.NS → ^BSESN / ^NSEI
-         before the data loader ever sees the symbol.
-  FIX 2 (500 thread): _run_predict() runs synchronously — no executor.
-  FIX 3 (404 portfolio): /portfolio/optimize alias route added.
-  FIX 4 (camelCase): Pydantic alias_generator accepts both camelCase
-         (frontend) and snake_case field names.
-"""
 
 import dataclasses
 import gc
